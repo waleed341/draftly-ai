@@ -1,0 +1,26 @@
+services:
+  api:
+    build: ./api
+    ports:
+      - "8000:8000"
+    environment:
+      DRAFTLY_LLM_MODEL: ${DRAFTLY_LLM_MODEL:-ollama:gemma4:31b-cloud}
+      DRAFTLY_OLLAMA_BASE_URL: ${DRAFTLY_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      DRAFTLY_DATABASE_URL: sqlite+aiosqlite:////data/draftly.db
+    volumes:
+      - draftly-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  draftly-data:
