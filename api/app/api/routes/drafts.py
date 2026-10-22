@@ -1,112 +1,61 @@
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Query, Response
 from fastapi.responses import StreamingResponse
 
-from app.api.routes.sse import encode
-from app.repositories.drafts import DraftRepository
-from app.schemas.drafts import Approval, DraftCreate, DraftEdit, SafetyCheckRequest
-from app.services.draft_service import DraftService
-from app.services.mappers import draft_out
-from app.services.parsing import parse_email
-from app.services.safety import check_input, check_output
+from app.api.deps import DraftServiceDep
+from app.api.routes.auth import current_user
+from app.api.sse import event_stream
+from app.models import User
+from app.schemas.drafts import (
+    ApproveRequest,
+    CreateDraftRequest,
+    DraftOut,
+    DraftStats,
+    DraftSummary,
+    EditRequest,
+    RewriteRequest,
+)
 
-router = APIRouter(prefix="/api")
-
-
-def service_from(request: Request) -> DraftService:
-    return request.app.state.draft_service
-
-
-@router.post("/drafts/stream")
-async def create_draft_stream(body: DraftCreate, request: Request):
-    service = service_from(request)
-    draft_id = await service.prepare_new(body)
-    return StreamingResponse(encode(service.run(draft_id, body.timezone, body.idea)),
-                            media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+router = APIRouter(prefix="/drafts", tags=["drafts"])
 
 
-@router.post("/drafts")
-async def create_draft(body: DraftCreate, request: Request):
-    service = service_from(request)
-    draft_id = await service.prepare_new(body)
-    last = None
-    async for event in service.run(draft_id, body.timezone, body.idea):
-        if event["type"] == "error":
-            raise HTTPException(502, event["message"])
-        if event["type"] == "ready":
-            last = event["draft"]
-    return last
+@router.get("", response_model=list[DraftSummary])
+async def list_drafts(service: DraftServiceDep, user: User = Depends(current_user), limit: int = Query(30, ge=1, le=100)) -> list[DraftSummary]:
+    return await service.list_recent(user.id, limit)
 
 
-@router.get("/drafts")
-async def history(request: Request):
-    async with request.app.state.sessions() as session:
-        drafts = await DraftRepository(session).list()
-        return [draft_out(draft) for draft in drafts]
+@router.get("/stats", response_model=DraftStats)
+async def draft_stats(service: DraftServiceDep, user: User = Depends(current_user)) -> DraftStats:
+    return await service.stats(user.id)
 
 
-@router.get("/drafts/{draft_id}")
-async def get_draft(draft_id: str, request: Request):
-    async with request.app.state.sessions() as session:
-        draft = await DraftRepository(session).get(draft_id)
-        if not draft:
-            raise HTTPException(404, "We couldn't find that draft.")
-        return draft_out(draft)
+@router.post("/stream", response_class=StreamingResponse)
+async def write_draft(body: CreateDraftRequest, service: DraftServiceDep, user: User = Depends(current_user)) -> StreamingResponse:
+    prepared = await service.prepare_new(body, user.id)
+    return event_stream(service.run(prepared))
 
 
-@router.post("/drafts/{draft_id}/rewrite")
-async def rewrite_draft(draft_id: str, request: Request, body: SafetyCheckRequest | None = None):
-    service = service_from(request)
-    timezone, idea, previous = await service.prepare_rewrite(draft_id, body.text if body else None)
-    return StreamingResponse(encode(service.run(draft_id, timezone, idea, previous)),
-                            media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+@router.get("/{draft_id}", response_model=DraftOut)
+async def get_draft(draft_id: int, service: DraftServiceDep, user: User = Depends(current_user)) -> DraftOut:
+    return await service.get(draft_id, user.id)
 
 
-@router.put("/drafts/{draft_id}/edit")
-async def edit_draft(draft_id: str, body: DraftEdit, request: Request):
-    check_input(f"{body.subject}\n{body.body}")
-    async with request.app.state.sessions() as session:
-        repo = DraftRepository(session)
-        draft = await repo.get(draft_id)
-        if not draft:
-            raise HTTPException(404, "We couldn't find that draft.")
-        if draft.status == "writing":
-            raise HTTPException(409, "This draft is still being written.")
-        await repo.add_version(draft, body.subject, body.body, "edited")
-        draft.status = "needs_review"
-        await session.commit()
-        await session.refresh(draft)
-        return draft_out(draft)
+@router.post("/{draft_id}/rewrite/stream", response_class=StreamingResponse)
+async def rewrite_draft(draft_id: int, body: RewriteRequest, service: DraftServiceDep, user: User = Depends(current_user)) -> StreamingResponse:
+    prepared = await service.prepare_rewrite(draft_id, body, user.id)
+    return event_stream(service.run(prepared))
 
 
-@router.post("/drafts/{draft_id}/approve")
-async def approve_draft(draft_id: str, body: Approval, request: Request):
-    if not body.reviewed:
-        raise HTTPException(422, "Please confirm that you reviewed the draft first.")
-    async with request.app.state.sessions() as session:
-        draft = await DraftRepository(session).get(draft_id)
-        if not draft:
-            raise HTTPException(404, "We couldn't find that draft.")
-        if draft.status == "writing":
-            raise HTTPException(409, "This draft is still being written.")
-        draft.status = "approved"
-        await session.commit()
-        await session.refresh(draft)
-        return draft_out(draft)
+@router.put("/{draft_id}", response_model=DraftOut)
+async def edit_draft(draft_id: int, body: EditRequest, service: DraftServiceDep, user: User = Depends(current_user)) -> DraftOut:
+    return await service.edit(draft_id, body, user.id)
 
 
-@router.delete("/drafts/{draft_id}", status_code=204)
-async def discard_draft(draft_id: str, request: Request):
-    async with request.app.state.sessions() as session:
-        draft = await DraftRepository(session).get(draft_id)
-        if not draft:
-            raise HTTPException(404, "We couldn't find that draft.")
-        await session.delete(draft)
-        await session.commit()
+@router.post("/{draft_id}/approve", response_model=DraftOut)
+async def approve_draft(draft_id: int, body: ApproveRequest, service: DraftServiceDep, user: User = Depends(current_user)) -> DraftOut:
+    return await service.approve(draft_id, body, user.id)
+
+
+@router.delete("/{draft_id}", status_code=204)
+async def discard_draft(draft_id: int, service: DraftServiceDep, user: User = Depends(current_user)) -> Response:
+    await service.discard(draft_id, user.id)
     return Response(status_code=204)
-
-
-@router.post("/safety/check")
-async def safety_check(body: SafetyCheckRequest):
-    check_input(body.text)
-    subject, content = parse_email(body.text)
-    return {"checks": check_output(subject, content)}

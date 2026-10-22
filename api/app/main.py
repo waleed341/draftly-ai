@@ -1,48 +1,63 @@
+import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
 
-from app import models  # noqa: F401
-from app.agents.langchain_writer import LangChainDraftWriter
-from app.api.routes.drafts import router
-from app.core.config import Settings
-from app.db.session import make_session_factory
+from app.agents.contracts import DraftWriter
+from app.api.routes import auth, drafts, gmail, meta, safety, schedules
+from app.core.config import Settings, get_settings
+from app.core.errors import register_error_handlers
+from app.core.logging import configure_logging
+from app.db.session import build_engine, build_session_factory, create_schema
+from app.repositories.uow import UnitOfWork
 from app.services.draft_service import DraftService
+from app.services.safety import SafetyService
+
+log = logging.getLogger(__name__)
 
 
-def create_app(settings: Settings | None = None, writer=None) -> FastAPI:
-    config = settings or Settings()
-    engine, sessions, initialize_db = make_session_factory(config.database_url)
+def create_app(settings: Settings | None = None, writer: DraftWriter | None = None) -> FastAPI:
+    settings = settings or get_settings()
+    configure_logging(settings.log_level)
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        await initialize_db()
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        engine = build_engine(settings.database_url)
+        await create_schema(engine)
+        session_factory = build_session_factory(engine)
+        app.state.sessions = session_factory
+        app.state.settings = settings
+        app.state.local_rate_limits = {}
+        draft_writer = writer
+        if draft_writer is None:
+            from app.agents.langchain_writer import LangChainDraftWriter
+
+            draft_writer = LangChainDraftWriter(settings)
+            log.info("Writer ready with model %s", settings.llm_model)
+        app.state.draft_service = DraftService(
+            uow_factory=lambda: UnitOfWork(session_factory),
+            writer=draft_writer,
+            safety=SafetyService(),
+            settings=settings,
+        )
         yield
         await engine.dispose()
 
-    app = FastAPI(title="Draftly", version="1.0.0", lifespan=lifespan)
-    app.state.sessions = sessions
-    app.state.draft_service = DraftService(sessions, writer or LangChainDraftWriter(config))
+    app = FastAPI(title=settings.app_name, lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+        allow_origins=settings.cors_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
         allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "DELETE"],
-        allow_headers=["Content-Type"],
     )
-    app.include_router(router)
-
-    @app.get("/", include_in_schema=False)
-    async def home() -> RedirectResponse:
-        return RedirectResponse(url="http://localhost:3000")
-
-    @app.get("/health", include_in_schema=False)
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
-
+    register_error_handlers(app)
+    for router in (meta.router, auth.router, drafts.router, safety.router, gmail.router, schedules.router):
+        app.include_router(router, prefix="/api")
     return app
 
 
+# Module-level app for `uv run fastapi dev` / `fastapi run` (they look for `app` in app/main.py).
 app = create_app()

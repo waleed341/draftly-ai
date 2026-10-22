@@ -1,8 +1,30 @@
+from dataclasses import dataclass
 from typing import Protocol
 
 
 class MailProvider(Protocol):
-    async def send(self, recipient: str, subject: str, body: str) -> None: ...
+    """Saves an approved draft to a mailbox. Nothing is ever sent automatically."""
+
+    key: str
+
+    async def save_draft(self, *, subject: str, body: str) -> str: ...
 
 
-CONNECTORS = {"gmail": {"status": "coming_soon", "label": "Gmail connector"}}
+@dataclass(frozen=True, slots=True)
+class ConnectorInfo:
+    key: str
+    name: str
+    description: str
+    status: str  # "available" | "coming_soon"
+
+
+CONNECTORS: list[ConnectorInfo] = [
+    ConnectorInfo(
+        "gmail", "Gmail connector", "Save approved drafts straight to your Gmail drafts.", "coming_soon"
+    ),
+    ConnectorInfo("outlook", "Outlook connector", "Save approved drafts to Outlook.", "coming_soon"),
+]
+
+
+def list_connectors() -> list[ConnectorInfo]:
+    return list(CONNECTORS)

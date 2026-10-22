@@ -1,66 +1,85 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
-from xml.sax.saxutils import escape
 
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
 
-from app.agents.contracts import TextDelta, ToolCalled, ToolReturned, WriteJob
-from app.agents.prompts import SYSTEM_PROMPT
-from app.agents.tools import date_tool_for_timezone
+from app.agents.contracts import TextDelta, ToolCalled, ToolReturned, WriteJob, WriterEvent
+from app.agents.prompts import SYSTEM_PROMPT, build_user_prompt
+from app.agents.tools import make_date_tool
 from app.core.config import Settings
 
-
-def _text_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text")
-    return ""
+log = logging.getLogger(__name__)
 
 
 class LangChainDraftWriter:
-    def __init__(self, settings: Settings):
-        kwargs = {"model_provider": "ollama"}
-        if settings.ollama_base_url:
-            kwargs["base_url"] = settings.ollama_base_url
-        self.model = init_chat_model(settings.normalized_model, **kwargs)
-        self.timeout = settings.request_timeout_seconds
+    """Runs a LangChain agent (model + date tool) and turns its stream into writer events."""
 
-    async def stream(self, job: WriteJob) -> AsyncIterator[ToolCalled | ToolReturned | TextDelta]:
-        agent = create_agent(model=self.model, tools=[date_tool_for_timezone(job.timezone)], system_prompt=SYSTEM_PROMPT)
-        prompt = f"<idea>\n{escape(job.idea)}\n</idea>"
-        if job.rewrite_from:
-            prompt += f"\n\n<previous_version>\n{job.rewrite_from}\n</previous_version>\nWrite a clearly different version."
-        called_date = False
-        async with asyncio.timeout(self.timeout):
-            async for item in agent.astream({"messages": [{"role": "user", "content": prompt}]}, stream_mode="messages"):
-                if isinstance(item, tuple):
-                    message, metadata = item
-                elif isinstance(item, dict) and item.get("type") == "messages":
-                    message, metadata = item["data"]
-                else:
-                    continue
-                node = metadata.get("langgraph_node", "")
-                name = getattr(message, "name", "") or getattr(message, "additional_kwargs", {}).get("name", "")
-                if node == "model":
-                    calls = getattr(message, "tool_calls", None) or []
-                    chunks = getattr(message, "tool_call_chunks", None) or []
-                    if calls or chunks:
-                        call_names = [call.get("name", "") for call in calls]
-                        call_names.extend(chunk.get("name", "") for chunk in chunks)
-                        for call_name in dict.fromkeys(call_names):
-                            if call_name:
-                                called_date |= call_name == "get_today_date"
-                                yield ToolCalled(call_name)
-                    else:
-                        content = _text_content(getattr(message, "content", ""))
-                        if content:
-                            yield TextDelta(content)
-                elif node == "tools":
-                    content = _text_content(getattr(message, "content", "")) or str(getattr(message, "content", ""))
-                    if name == "get_today_date":
-                        yield ToolReturned(name, content)
-        if not called_date:
-            yield ToolReturned("get_today_date", date_tool_for_timezone(job.timezone).invoke({}))
+    def __init__(self, settings: Settings) -> None:
+        kwargs: dict[str, Any] = {"temperature": settings.llm_temperature}
+        if settings.llm_base_url:
+            kwargs["base_url"] = settings.llm_base_url
+        self._model = init_chat_model(settings.llm_model, **kwargs)
+        self._timeout = settings.llm_timeout_seconds
+
+    async def stream(self, job: WriteJob) -> AsyncIterator[WriterEvent]:
+        agent = create_agent(
+            model=self._model, tools=[make_date_tool(job.time_zone)], system_prompt=SYSTEM_PROMPT
+        )
+        inputs = {"messages": [{"role": "user", "content": build_user_prompt(job)}]}
+        items = agent.astream(inputs, stream_mode="messages").__aiter__()
+        deadline = asyncio.get_running_loop().time() + self._timeout
+        try:
+            while True:
+                # The timeout only covers waiting on the model, never the consumer's own work.
+                async with asyncio.timeout_at(deadline):
+                    item = await anext(items, None)
+                if item is None:
+                    return
+                for event in _to_events(item):
+                    yield event
+        finally:
+            await items.aclose()
+
+
+def _to_events(item: Any) -> list[WriterEvent]:
+    message, metadata = _unpack(item)
+    if message is None:
+        return []
+    node = (metadata or {}).get("langgraph_node")
+    events: list[WriterEvent] = []
+    if node == "tools":
+        events.append(ToolReturned(name=getattr(message, "name", "") or "", output=_text(message.content)))
+        return events
+    if node == "model":
+        for chunk in getattr(message, "tool_call_chunks", None) or []:
+            if chunk.get("name"):
+                events.append(ToolCalled(name=chunk["name"]))
+        text = _text(message.content)
+        if text:
+            events.append(TextDelta(text=text))
+    return events
+
+
+def _unpack(item: Any) -> tuple[Any, dict | None]:
+    if isinstance(item, dict) and item.get("type") == "messages":
+        item = item.get("data")
+    if isinstance(item, tuple | list) and len(item) == 2:
+        return item[0], item[1]
+    return None, None
+
+
+def _text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "".join(parts)
+    return ""

@@ -1,29 +1,47 @@
+"""What the services need from a writer. Nothing here knows about LangChain."""
+
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class PreviousVersion:
+    subject: str
+    body: str
+
+
+@dataclass(frozen=True, slots=True)
 class WriteJob:
     idea: str
-    timezone: str
-    rewrite_from: str | None = None
+    kind: str
+    tone: str
+    length: str
+    time_zone: str
+    previous: PreviousVersion | None = None
+    instructions: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ToolCalled:
     name: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ToolReturned:
     name: str
-    value: str
+    output: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TextDelta:
     text: str
 
 
+WriterEvent = ToolCalled | ToolReturned | TextDelta
+
+DATE_TOOL_NAME = "get_today"
+
+
 class DraftWriter(Protocol):
-    async def stream(self, job: WriteJob): ...
+    def stream(self, job: WriteJob) -> AsyncIterator[WriterEvent]: ...

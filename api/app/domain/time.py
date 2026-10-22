@@ -1,13 +1,22 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-def safe_zone(name: str) -> ZoneInfo:
+def utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def safe_zone(name: str | None) -> ZoneInfo:
+    """The person's time zone, or UTC when it is missing or unknown."""
+    if not name:
+        return ZoneInfo("UTC")
     try:
         return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValueError("Please choose a valid time zone.") from exc
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo("UTC")
 
 
-def today_label(zone: ZoneInfo) -> str:
-    return datetime.now(zone).strftime("%A, %d %B %Y, %I:%M %p %Z")
+def today_label(zone_name: str | None, now: datetime | None = None) -> str:
+    """For example "Tuesday, 20 October 2026"."""
+    local = (now or utcnow()).astimezone(safe_zone(zone_name))
+    return f"{local:%A}, {local.day} {local:%B %Y}"

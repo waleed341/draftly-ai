@@ -1,28 +1,46 @@
-import { copy } from "@/features/drafts/constants";
+import { apiFetch } from "./http";
 
-export async function readEventStream<T>(
-  response: Response,
-  onEvent: (event: T) => void,
-  signal?: AbortSignal,
-) {
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(typeof data.detail === "string" ? data.detail : copy.errors.stream);
-  }
-  if (!response.body) throw new Error(copy.errors.stream);
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
+/** POST a JSON body and read the `text/event-stream` reply, calling `onEvent` for every `data:` message. */
+export async function postStream<E>(
+  path: string,
+  body: unknown,
+  onEvent: (event: E) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const response = await apiFetch(path, {
+    method: "POST",
+    body: JSON.stringify(body),
+    headers: { Accept: "text/event-stream" },
+    signal,
+  });
+  if (!response.body) return;
+
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  // Aborting does not always reach a piped stream, so cancel the reader ourselves.
+  const cancel = () => void reader.cancel().catch(() => undefined);
+  signal.addEventListener("abort", cancel, { once: true });
   let buffer = "";
-  while (true) {
-    if (signal?.aborted) { await reader.cancel(); return; }
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const frames = buffer.split("\n\n");
-    buffer = frames.pop() ?? "";
-    for (const frame of frames) {
-      const data = frame.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
-      if (data) onEvent(JSON.parse(data) as T);
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (signal.aborted) throw new DOMException("The run was stopped.", "AbortError");
+      if (done) break;
+      buffer += value;
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary !== -1) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const data = block
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart())
+          .join("\n");
+        if (data) onEvent(JSON.parse(data) as E);
+        boundary = buffer.indexOf("\n\n");
+      }
     }
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    reader.releaseLock();
   }
 }

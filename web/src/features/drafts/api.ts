@@ -1,26 +1,46 @@
 import { request } from "@/lib/http";
-import { Draft, DraftEdit, StreamEvent } from "@/features/drafts/types";
-import { readEventStream } from "@/lib/sse";
+import { postStream } from "@/lib/sse";
+import type {
+  CheckResult,
+  Connector,
+  CreateDraftInput,
+  Draft,
+  DraftStats,
+  DraftSummary,
+  RewriteInput,
+  StreamEvent,
+} from "./types";
 
-const tz = () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
+export const draftKeys = {
+  all: ["drafts"] as const,
+  list: () => [...draftKeys.all, "list"] as const,
+  stats: () => [...draftKeys.all, "stats"] as const,
+  detail: (id: number) => [...draftKeys.all, "detail", id] as const,
+  connectors: ["connectors"] as const,
+};
 
-async function stream(path: string, payload: unknown, onEvent: (event: StreamEvent) => void, signal?: AbortSignal) {
-  const response = await fetch(`${API_URL}${path}`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), signal,
-  });
-  await readEventStream<StreamEvent>(response, onEvent, signal);
-}
+type OnEvent = (event: StreamEvent) => void;
 
-export const draftApi = {
-  create: (idea: string, onEvent: (event: StreamEvent) => void, signal?: AbortSignal) =>
-    stream("/api/drafts/stream", { idea, timezone: tz() }, onEvent, signal),
-  rewrite: (id: string, instruction: string, onEvent: (event: StreamEvent) => void, signal?: AbortSignal) =>
-    stream(`/api/drafts/${id}/rewrite`, instruction ? { text: instruction } : null, onEvent, signal),
-  history: () => request<Draft[]>("/api/drafts"),
-  get: (id: string) => request<Draft>(`/api/drafts/${id}`),
-  edit: (id: string, data: DraftEdit) => request<Draft>(`/api/drafts/${id}/edit`, { method: "PUT", body: JSON.stringify(data) }),
-  approve: (id: string) => request<Draft>(`/api/drafts/${id}/approve`, { method: "POST", body: JSON.stringify({ reviewed: true }) }),
-  discard: (id: string) => request<void>(`/api/drafts/${id}`, { method: "DELETE" }),
-  safety: (text: string) => request<{ checks: Draft["checks"] }>("/api/safety/check", { method: "POST", body: JSON.stringify({ text }) }),
+export const draftsApi = {
+  list: () => request<DraftSummary[]>("/api/drafts?limit=30"),
+  stats: () => request<DraftStats>("/api/drafts/stats"),
+  get: (id: number) => request<Draft>(`/api/drafts/${id}`),
+  connectors: () => request<Connector[]>("/api/connectors"),
+
+  write: (input: CreateDraftInput, onEvent: OnEvent, signal: AbortSignal) =>
+    postStream<StreamEvent>("/api/drafts/stream", input, onEvent, signal),
+  rewrite: (id: number, input: RewriteInput, onEvent: OnEvent, signal: AbortSignal) =>
+    postStream<StreamEvent>(`/api/drafts/${id}/rewrite/stream`, input, onEvent, signal),
+
+  edit: (id: number, subject: string, body: string) =>
+    request<Draft>(`/api/drafts/${id}`, { method: "PUT", body: JSON.stringify({ subject, body }) }),
+  approve: (id: number, details: { to: string[]; gmail_connection_id: number }) =>
+    request<Draft>(`/api/drafts/${id}/approve`, { method: "POST", body: JSON.stringify({ reviewed: true, ...details }) }),
+  saveGmailDraft: (id: number, connection_id: number) =>
+    request<{ status: string }>(`/api/gmail/drafts/${id}`, { method: "POST", body: JSON.stringify({ connection_id }) }),
+  schedule: (approval_id: number, send_at: string) =>
+    request<{ id: number; status: string }>("/api/schedules", { method: "POST", body: JSON.stringify({ approval_id, send_at }) }),
+  discard: (id: number) => request<void>(`/api/drafts/${id}`, { method: "DELETE" }),
+  check: (subject: string, body: string, signal?: AbortSignal) =>
+    request<CheckResult>("/api/safety/check", { method: "POST", body: JSON.stringify({ subject, body }), signal }),
 };
